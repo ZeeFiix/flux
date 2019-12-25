@@ -1,3 +1,4 @@
+{{- if .Values.memcached.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -17,10 +18,21 @@ spec:
       release: {{ .Release.Name }}
   template:
     metadata:
+      {{- if .Values.memcached.annotations }}
+      annotations:
+      {{- .Values.memcached.annotations | toYaml | trimSuffix "\n" | nindent 8 }}
+      {{- end }}
       labels:
         app: {{ template "flux.name" . }}-memcached
         release: {{ .Release.Name }}
     spec:
+      {{- if .Values.memcached.pullSecret }}
+      imagePullSecrets:
+        - name: {{ .Values.memcached.pullSecret }}
+      {{- end }}
+      {{- if .Values.rbac.pspEnabled }}
+      serviceAccountName: {{ template "flux.serviceAccountName" . }}
+      {{- end }}
       containers:
       - name: memcached
         image: {{ .Values.memcached.repository }}:{{ .Values.memcached.tag }}
@@ -37,8 +49,11 @@ spec:
           containerPort: 11211
         resources:
 {{ toYaml .Values.memcached.resources | indent 10 }}
-    {{- with .Values.memcached.nodeSelector }}
+        securityContext:
+{{ toYaml .Values.memcached.securityContext | indent 10 }}
       nodeSelector:
+        beta.kubernetes.io/os: linux
+      {{- with .Values.memcached.nodeSelector }}
 {{ toYaml . | indent 8 }}
     {{- end }}
     {{- with .Values.memcached.affinity }}
@@ -47,10 +62,6 @@ spec:
     {{- end }}
     {{- with .Values.memcached.tolerations }}
       tolerations:
-{{ toYaml . | indent 8 }}
-    {{- end }}
-    {{- with .Values.memcached.securityContext }}
-      securityContext:
 {{ toYaml . | indent 8 }}
     {{- end }}
 ---
@@ -75,3 +86,4 @@ spec:
   selector:
     app: {{ template "flux.name" . }}-memcached
     release: {{ .Release.Name }}
+{{- end }}

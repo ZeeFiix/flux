@@ -6,14 +6,15 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 
-	"github.com/weaveworks/flux/api"
-	transport "github.com/weaveworks/flux/http"
-	"github.com/weaveworks/flux/http/client"
+	"github.com/fluxcd/flux/pkg/api"
+	transport "github.com/fluxcd/flux/pkg/http"
+	"github.com/fluxcd/flux/pkg/http/client"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -21,7 +22,9 @@ type rootOpts struct {
 	URL       string
 	Token     string
 	Namespace string
+	Labels    map[string]string
 	API       api.Server
+	Timeout   time.Duration
 }
 
 func newRoot() *rootOpts {
@@ -34,26 +37,28 @@ fluxctl helps you deploy your code.
 Connecting:
 
   # To a fluxd running in namespace "default" in your current kubectl context
-  fluxctl list-controllers
+  fluxctl list-workloads
 
   # To a fluxd running in namespace "weave" in your current kubectl context
-  fluxctl --k8s-fwd-ns=weave list-controllers
+  fluxctl --k8s-fwd-ns=weave list-workloads
 
   # To a Weave Cloud instance, with your instance token in $TOKEN
-  fluxctl --token $TOKEN list-controllers
+  fluxctl --token $TOKEN list-workloads
 
 Workflow:
-  fluxctl list-controllers                                                   # Which controllers are running?
-  fluxctl list-images --controller=default:deployment/foo                    # Which images are running/available?
-  fluxctl release --controller=default:deployment/foo --update-image=bar:v2  # Release new version.
+  fluxctl list-workloads                                                   # Which workloads are running?
+  fluxctl list-images --workload=default:deployment/foo                    # Which images are running/available?
+  fluxctl release --workload=default:deployment/foo --update-image=bar:v2  # Release new version.
 `)
 
 const (
+	defaultURLGivenToken  = "https://cloud.weave.works/api/flux"
 	envVariableURL        = "FLUX_URL"
 	envVariableNamespace  = "FLUX_FORWARD_NAMESPACE"
+	envVariableLabels     = "FLUX_FORWARD_LABELS"
 	envVariableToken      = "FLUX_SERVICE_TOKEN"
 	envVariableCloudToken = "WEAVE_CLOUD_TOKEN"
-	defaultURLGivenToken  = "https://cloud.weave.works/api/flux"
+	envVariableTimeout    = "FLUX_TIMEOUT"
 )
 
 func (opts *rootOpts) Command() *cobra.Command {
@@ -67,40 +72,47 @@ func (opts *rootOpts) Command() *cobra.Command {
 
 	cmd.PersistentFlags().StringVar(&opts.Namespace, "k8s-fwd-ns", "default",
 		fmt.Sprintf("Namespace in which fluxd is running, for creating a port forward to access the API. No port forward will be created if a URL or token is given. You can also set the environment variable %s", envVariableNamespace))
+	cmd.PersistentFlags().StringToStringVar(&opts.Labels, "k8s-fwd-labels", map[string]string{"app": "flux"},
+		fmt.Sprintf("Labels used to select the fluxd pod a port forward should be created for. You can also set the environment variable %s", envVariableLabels))
 	cmd.PersistentFlags().StringVarP(&opts.URL, "url", "u", "",
-		fmt.Sprintf("Base URL of the flux API (defaults to %q if a token is provided); you can also set the environment variable %s", defaultURLGivenToken, envVariableURL))
+		fmt.Sprintf("Base URL of the Flux API (defaults to %q if a token is provided); you can also set the environment variable %s", defaultURLGivenToken, envVariableURL))
 	cmd.PersistentFlags().StringVarP(&opts.Token, "token", "t", "",
 		fmt.Sprintf("Weave Cloud authentication token; you can also set the environment variable %s or %s", envVariableCloudToken, envVariableToken))
-
+	cmd.PersistentFlags().DurationVar(&opts.Timeout, "timeout", 60*time.Second,
+		fmt.Sprintf("Global command timeout; you can also set the environment variable %s", envVariableTimeout))
 	cmd.AddCommand(
 		newVersionCommand(),
-		newServiceList(opts).Command(),
-		newControllerShow(opts).Command(),
-		newControllerList(opts).Command(),
-		newControllerRelease(opts).Command(),
-		newServiceAutomate(opts).Command(),
-		newControllerDeautomate(opts).Command(),
-		newControllerLock(opts).Command(),
-		newControllerUnlock(opts).Command(),
-		newControllerPolicy(opts).Command(),
+		newImageList(opts).Command(),
+		newWorkloadList(opts).Command(),
+		newWorkloadRelease(opts).Command(),
+		newWorkloadAutomate(opts).Command(),
+		newWorkloadDeautomate(opts).Command(),
+		newWorkloadLock(opts).Command(),
+		newWorkloadUnlock(opts).Command(),
+		newWorkloadPolicy(opts).Command(),
 		newSave(opts).Command(),
 		newIdentity(opts).Command(),
 		newSync(opts).Command(),
+		newInstall().Command(),
 	)
 
 	return cmd
 }
 
 func (opts *rootOpts) PersistentPreRunE(cmd *cobra.Command, _ []string) error {
-	// skip port forward for version command
+	// skip port forward for certain commands
 	switch cmd.Use {
 	case "version":
+		fallthrough
+	case "install":
 		return nil
 	}
 
-	opts.Namespace = getFromEnvIfNotSet(cmd.Flags(), "k8s-fwd-ns", opts.Namespace, envVariableNamespace)
-	opts.Token = getFromEnvIfNotSet(cmd.Flags(), "token", opts.Token, envVariableToken, envVariableCloudToken)
-	opts.URL = getFromEnvIfNotSet(cmd.Flags(), "url", opts.URL, envVariableURL)
+	setFromEnvIfNotSet(cmd.Flags(), "k8s-fwd-ns", envVariableNamespace)
+	setFromEnvIfNotSet(cmd.Flags(), "k8s-fwd-labels", envVariableLabels)
+	setFromEnvIfNotSet(cmd.Flags(), "token", envVariableToken, envVariableCloudToken)
+	setFromEnvIfNotSet(cmd.Flags(), "url", envVariableURL)
+	setFromEnvIfNotSet(cmd.Flags(), "timeout", envVariableTimeout)
 
 	if opts.Token != "" && opts.URL == "" {
 		opts.URL = defaultURLGivenToken
@@ -108,16 +120,14 @@ func (opts *rootOpts) PersistentPreRunE(cmd *cobra.Command, _ []string) error {
 
 	if opts.URL == "" {
 		portforwarder, err := tryPortforwards(opts.Namespace, metav1.LabelSelector{
+			MatchLabels: opts.Labels,
+		}, metav1.LabelSelector{
 			MatchExpressions: []metav1.LabelSelectorRequirement{
 				metav1.LabelSelectorRequirement{
 					Key:      "name",
 					Operator: metav1.LabelSelectorOpIn,
 					Values:   []string{"flux", "fluxd", "weave-flux-agent"},
 				},
-			},
-		}, metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				"app": "flux",
 			},
 		})
 		if err != nil {
@@ -135,14 +145,13 @@ func (opts *rootOpts) PersistentPreRunE(cmd *cobra.Command, _ []string) error {
 	return nil
 }
 
-func getFromEnvIfNotSet(flags *pflag.FlagSet, flagName, value string, envNames ...string) string {
+func setFromEnvIfNotSet(flags *pflag.FlagSet, flagName string, envNames ...string) {
 	if flags.Changed(flagName) {
-		return value
+		return
 	}
 	for _, envName := range envNames {
 		if env := os.Getenv(envName); env != "" {
-			return env
+			flags.Set(flagName, env)
 		}
 	}
-	return value // not changed, so presumably the default
 }

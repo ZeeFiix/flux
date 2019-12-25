@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/weaveworks/flux/git"
-	"github.com/weaveworks/flux/update"
+	"github.com/fluxcd/flux/pkg/git"
+	"github.com/fluxcd/flux/pkg/update"
 )
 
 type syncOpts struct {
@@ -45,10 +46,10 @@ func (opts *syncOpts) RunE(cmd *cobra.Command, args []string) error {
 	case git.RepoReady:
 		break
 	default:
-		return fmt.Errorf("git repository %s is not ready to sync (status: %s)", gitConfig.Remote.URL, string(gitConfig.Status))
+		return fmt.Errorf("git repository %s is not ready to sync (status: %s)", gitConfig.Remote.SafeURL(), string(gitConfig.Status))
 	}
 
-	fmt.Fprintf(cmd.OutOrStderr(), "Synchronizing with %s\n", gitConfig.Remote.URL)
+	fmt.Fprintf(cmd.OutOrStderr(), "Synchronizing with %s\n", gitConfig.Remote.SafeURL())
 
 	updateSpec := update.Spec{
 		Type: update.Sync,
@@ -58,19 +59,27 @@ func (opts *syncOpts) RunE(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	result, err := awaitJob(ctx, opts.API, jobID)
-	if err != nil {
+	result, err := awaitJob(ctx, opts.API, jobID, opts.Timeout)
+	if isUnverifiedHead(err) {
+		fmt.Fprintf(cmd.OutOrStderr(), "Warning: %s\n", err)
+	} else if err != nil {
 		fmt.Fprintf(cmd.OutOrStderr(), "Failed to complete sync job (ID %q)\n", jobID)
 		return err
 	}
 
 	rev := result.Revision[:7]
-	fmt.Fprintf(cmd.OutOrStderr(), "HEAD of %s is %s\n", gitConfig.Remote.Branch, rev)
+	fmt.Fprintf(cmd.OutOrStderr(), "Revision of %s to apply is %s\n", gitConfig.Remote.Branch, rev)
 	fmt.Fprintf(cmd.OutOrStderr(), "Waiting for %s to be applied ...\n", rev)
-	err = awaitSync(ctx, opts.API, rev)
+	err = awaitSync(ctx, opts.API, rev, opts.Timeout)
 	if err != nil {
 		return err
 	}
 	fmt.Fprintln(cmd.OutOrStderr(), "Done.")
 	return nil
+}
+
+func isUnverifiedHead(err error) bool {
+	return err != nil &&
+		(strings.Contains(err.Error(), "branch HEAD in the git repo is not verified") &&
+			strings.Contains(err.Error(), "last verified commit was"))
 }
